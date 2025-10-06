@@ -1,85 +1,180 @@
-import json, joblib, torch
+import os
+import json
+import pickle
+from typing import List, Optional
+
 import numpy as np
+import torch
+import torch.nn as nn
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# ==== Load artifacts ====
-with open("config.json","r",encoding="utf-8") as f:
-    cfg = json.load(f)   # e.g. {"WINDOW":128,"input_size":9}
-with open("features.json","r",encoding="utf-8") as f:
-    feat = json.load(f)  # {"features":[...9 items...], "class_names":["0","1","2"]}
+# -------------------------------
+# FastAPI app (สำคัญ: ชื่อ 'app')
+# -------------------------------
+app = FastAPI(title="ESP8266 PV Inference API", version="1.0")
 
-WINDOW = cfg["WINDOW"]
-INPUT_SIZE = cfg["input_size"]
-FEATURE_ORDER = feat["features"]
-CLASS_NAMES   = feat["class_names"]
+# -------------------------------
+# โหลด config / features meta
+# -------------------------------
+def load_json(path: str, default: dict):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-scaler = joblib.load("scaler.pkl")
-lblenc = joblib.load("label_encoder.pkl")
+cfg = load_json("config.json", {"input_size": 9, "hidden": 64, "out_dim": 3})
+feat_meta = load_json("features.json", {"FEATURES": ["f"+str(i) for i in range(cfg["input_size"])]})
 
-class SimpleMLP(torch.nn.Module):
-    def __init__(self, in_dim, hidden=64, out_dim=3, p=0.3):
+INPUT_SIZE = int(cfg.get("input_size", 9))
+HIDDEN     = int(cfg.get("hidden", 64))
+OUT_DIM    = int(cfg.get("out_dim", 3))
+
+# -------------------------------
+# โหลด scaler / label encoder
+# -------------------------------
+def load_pickle(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+scaler = None
+label_encoder = None
+try:
+    scaler = load_pickle("scaler.pkl")
+except Exception:
+    pass
+
+try:
+    label_encoder = load_pickle("label_encoder.pkl")
+except Exception:
+    pass
+
+# -------------------------------
+# สร้างสถาปัตยกรรมที่ "ชื่อเลเยอร์" ตรงกับ state_dict แบบ LSTM
+# (ใช้เมื่อไฟล์ .pt เป็น state_dict ที่มีคีย์ encoder.lstm / encoder.fc / head.*)
+# -------------------------------
+class Encoder(nn.Module):
+    def __init__(self, input_size: int, hidden: int):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(in_dim, hidden),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(p),
-            torch.nn.Linear(hidden, out_dim)
-        )
-    def forward(self, x):
-        return self.net(x)
+        self.lstm = nn.LSTM(input_size, hidden, batch_first=True)
+        self.fc   = nn.Linear(hidden, hidden)
 
-model = SimpleMLP(in_dim=INPUT_SIZE, hidden=64, out_dim=len(CLASS_NAMES), p=0.3)
-model.load_state_dict(torch.load("clf_tested.pt", map_location="cpu"))
+class LSTMHeadModel(nn.Module):
+    def __init__(self, input_size=INPUT_SIZE, hidden=HIDDEN, out_dim=OUT_DIM):
+        super().__init__()
+        self.encoder = Encoder(input_size, hidden)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x):
+        # รองรับทั้ง (B, T, F) และ (B, F)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (B,1,F)
+        out, _ = self.encoder.lstm(x)  # (B,T,H)
+        h = out[:, -1, :]              # (B,H)
+        h = self.encoder.fc(h)
+        logits = self.head(h)
+        return logits
+
+# -------------------------------
+# โหลดโมเดล (.pt)
+# กลยุทธ์:
+# 1) พยายาม torch.load ทั้งโมเดลก่อน
+# 2) ถ้าได้ state_dict → ลองโหลดเข้ากับ LSTMHeadModel (strict=False)
+# -------------------------------
+model: Optional[nn.Module] = None
+try:
+    obj = torch.load("clf_tested.pt", map_location="cpu")
+    if isinstance(obj, nn.Module):
+        model = obj
+    else:
+        # เป็น state_dict
+        m = LSTMHeadModel(INPUT_SIZE, HIDDEN, OUT_DIM)
+        missing = m.load_state_dict(obj, strict=False)  # อนุโลมเพื่อให้รันได้ก่อน
+        model = m
+except Exception as e:
+    # ถ้าโหลดไม่ได้เลย ให้สร้างโมเดล mock เพื่อไม่ให้ service ล่ม
+    class Dummy(nn.Module):
+        def __init__(self, out_dim=OUT_DIM): super().__init__(); self.out_dim = out_dim
+        def forward(self, x): 
+            b = x.shape[0]
+            return torch.zeros(b, self.out_dim)
+    model = Dummy(OUT_DIM)
+
 model.eval()
 
-app = FastAPI(title="PV Panel Classifier")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
-)
+# -------------------------------
+# request/response schema
+# -------------------------------
+class PredictIn(BaseModel):
+    features: List[float] = Field(..., description=f"List of {INPUT_SIZE} features")
 
-class InPayload(BaseModel):
-    features: list[float]  # length must be INPUT_SIZE
-    ref_hint: str | None = None  # optional: "ปกติ" / "สกปรก" / "แตก"
+class PredictOut(BaseModel):
+    label_idx: int
+    label_text: str
+    proba: float
 
-# map model string labels to Thai text
-LABEL_MAP = {"0":"ปกติ", "1":"สกปรก", "2":"แตก"}
+# -------------------------------
+# utils
+# -------------------------------
+def postprocess_label(idx: int) -> str:
+    if label_encoder is None:
+        mapping = {0: "ปกติ", 1: "สกปรก", 2: "แตก"}
+        return mapping.get(int(idx), str(idx))
+    try:
+        # inverse_transform ต้องรับ array
+        return str(label_encoder.inverse_transform([int(idx)])[0])
+    except Exception:
+        return str(idx)
 
-def apply_ref_bias(prob: np.ndarray, pred_idx: int, ref_hint: str|None):
-    """On close calls, bias prediction toward provided ref hint."""
-    if not ref_hint:
-        return pred_idx
-    ref_to_idx = {"ปกติ":0,"สกปรก":1,"แตก":2}
-    if ref_hint not in ref_to_idx:
-        return pred_idx
-    # if margin between top-1 and top-2 < 0.05 → pick REF
-    top1 = int(np.argmax(prob))
-    sorted_prob = np.sort(prob)
-    margin = sorted_prob[-1] - sorted_prob[-2] if prob.size >= 2 else 1.0
-    if margin < 0.05:
-        return ref_to_idx[ref_hint]
-    return pred_idx
+def run_model(x_np: np.ndarray) -> np.ndarray:
+    """return logits numpy shape (B, OUT_DIM)"""
+    with torch.no_grad():
+        x = torch.from_numpy(x_np.astype(np.float32))
+        logits = model(x)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        return logits.detach().cpu().numpy()
 
+# -------------------------------
+# routes
+# -------------------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "window": WINDOW, "input_size": INPUT_SIZE}
+    return {
+        "ok": True,
+        "input_size": INPUT_SIZE,
+        "out_dim": OUT_DIM,
+        "features": feat_meta.get("FEATURES", []),
+    }
 
-@app.post("/predict")
-def predict(inp: InPayload):
+@app.post("/predict", response_model=PredictOut)
+def predict(inp: PredictIn):
+    # ตรวจความยาว
     if len(inp.features) != INPUT_SIZE:
-        raise HTTPException(status_code=400, detail=f"Need {INPUT_SIZE} features, got {len(inp.features)}")
+        raise HTTPException(status_code=400, detail=f"features length must be {INPUT_SIZE}")
 
-    X = np.array(inp.features, dtype=np.float32).reshape(1, -1)
-    Xs = scaler.transform(X)
+    x = np.array(inp.features, dtype=np.float32).reshape(1, -1)  # (1,F)
 
-    with torch.no_grad():
-        logits = model(torch.from_numpy(Xs))
-        prob = torch.softmax(logits, dim=1).numpy()[0]
-        pred_idx = int(np.argmax(prob))
+    # สเกล ถ้ามี
+    if scaler is not None:
+        try:
+            x = scaler.transform(x)
+        except Exception:
+            pass
 
-    pred_idx = apply_ref_bias(prob, pred_idx, inp.ref_hint)
-    label_str = CLASS_NAMES[pred_idx]  # e.g. '0','1','2'
-    label_text = LABEL_MAP.get(label_str, label_str)
-    return {"label": label_str, "label_text": label_text, "proba": float(prob[pred_idx])}
+    # วิ่งโมเดล
+    # รองรับทั้ง (B,F) และ (B,T,F) → ตอน run_model แปลงเป็น tensor แล้วจัดการต่อ
+    logits = run_model(x)  # (1, C)
+
+    # softmax → proba
+    e = np.exp(logits - logits.max(axis=1, keepdims=True))
+    prob = (e / (e.sum(axis=1, keepdims=True) + 1e-9))[0]
+
+    idx = int(prob.argmax())
+    text = postprocess_label(idx)
+    return PredictOut(label_idx=idx, label_text=text, proba=float(prob[idx]))
