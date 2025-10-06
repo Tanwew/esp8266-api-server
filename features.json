@@ -1,0 +1,18 @@
+{
+  "features": [
+    "RMS_vol",
+    "RMS_amp",
+    "RMS_watt",
+    "ZCR_vol",
+    "ZCR_amp",
+    "ZCR_watt",
+    "SSC_vol",
+    "SSC_amp",
+    "SSC_watt"
+  ],
+  "class_names": [
+    "0",
+    "1",
+    "2"
+  ]
+}

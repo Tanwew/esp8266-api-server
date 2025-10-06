@@ -1,0 +1,7 @@
+{
+  "WINDOW": 128,
+  "HIDDEN": 64,
+  "LATENT": 64,
+  "DROPOUT": 0.3,
+  "input_size": 9
+}
