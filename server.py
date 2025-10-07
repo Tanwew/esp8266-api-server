@@ -1,8 +1,11 @@
+# server.py
 # -------------------------------------------
 # ESP8266 PV Inference API + Telegram Alert
-# แจ้งเตือน "ทุกครั้ง" ที่มีการทำนาย (ไม่ใช้เกณฑ์ความมั่นใจ)
-# - รองรับฟีเจอร์ 9 หรือ 12 ตัวอัตโนมัติ
-# - รูปแบบข้อความ: พบแผงโซล่าเซลล์ประเภท “{label}” (p={:.2f})
+# - รองรับ 9 หรือ 12 ฟีเจอร์อัตโนมัติ
+# - มีกฎ Override ตามแรงดัน:
+#     V < 38     -> แตก (label 2)
+#     38 <= V<39 -> สกปรก (label 1)
+#     V >= 39    -> ปกติ (label 0)
 # -------------------------------------------
 
 import os
@@ -25,13 +28,18 @@ log = logging.getLogger("api")
 # ============== FastAPI ==============
 app = FastAPI(title="ESP8266 PV Inference API", version="1.3")
 
-# ============== Telegram Config (ENV) ==============
+# ============== Config ==============
+# แจ้งเตือนทุกผลลัพธ์ (ตามที่คุยไว้)
+ALERT_LABELS = {0, 1, 2}    # ปกติ/สกปรก/แตก -> แจ้งทุกแบบ
+ALERT_PROBA  = 0.50         # ตั้งค่าต่ำไว้เพื่อให้แจ้งแน่ ๆ
+
+# ENV (ถ้าไม่ได้ตั้ง จะใช้ค่าด้านหลัง)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "8279950843")
 
-# ============== Model / Scaler / LabelEncoder ==============
+# ============== Model / Scaler / Label Encoder ==============
 class SimpleMLP(nn.Module):
-    """ตัวอย่างโครงข่ายสำหรับ 9 ฟีเจอร์ → 3 คลาส"""
+    """MLP ง่าย ๆ รับ 9 ฟีเจอร์ ออก 3 คลาส"""
     def __init__(self, in_dim=9, hidden=64, out_dim=3):
         super().__init__()
         self.net = nn.Sequential(
@@ -72,9 +80,9 @@ MODEL.eval()
 
 # ============== Schemas ==============
 class FeaturePacket(BaseModel):
-    # data รองรับ 9 หรือ 12 ค่า
-    data: List[float] = Field(..., description="feature vector (9 หรือ 12 ค่า)")
-    # ค่าเสริมจากอุปกรณ์ (optional)
+    # รับ 9 หรือ 12 ฟีเจอร์
+    data: List[float] = Field(..., description="Feature vector (9 or 12)")
+    # ค่าส่งประกอบ (optional)
     v: Optional[float] = None
     i: Optional[float] = None
     p: Optional[float] = None
@@ -97,19 +105,23 @@ class PredictOut(BaseModel):
     p: Optional[float] = None
 
 # ============== Utils ==============
-LABEL_FALLBACK = {0: "ปกติ", 1: "สกปรก", 2: "แตก"}
-
-def _label_text(idx: int) -> str:
-    if LABEL_ENCODER is not None:
-        try:
-            return str(LABEL_ENCODER.inverse_transform([idx])[0])
-        except Exception:
-            pass
-    return LABEL_FALLBACK.get(idx, str(idx))
+def send_telegram_message(text: str) -> bool:
+    token = TELEGRAM_BOT_TOKEN
+    chat_id = TELEGRAM_CHAT_ID
+    if not token or not chat_id:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        r = requests.post(url, json=payload, timeout=5)
+        return bool(r.ok)
+    except Exception as e:
+        log.warning("Telegram error: %s", e)
+        return False
 
 def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
     """
-    Map 12 → 9 ตามรูปแบบ:
+    12 -> 9 mapping:
     12 = [v_rms, i_rms, p_rms, v_zc, i_zc, p_zc, v_ssc, i_ssc, p_ssc, v_mean, i_mean, p_mean]
     9  = [v_rms, i_rms, p_rms, v_zc, i_zc, v_ssc, i_ssc, v_mean, i_mean]
     """
@@ -117,12 +129,12 @@ def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
     return arr12[idx]
 
 def _prepare_input(x: List[float]) -> np.ndarray:
+    """รับ list (9/12) -> numpy (1,9) และ normalize ถ้ามี SCALER"""
     arr = np.array(x, dtype=np.float32)
     if arr.shape[0] == 12:
         arr = _map_12_to_9(arr)
     elif arr.shape[0] != 9:
         raise ValueError("Expect 9 or 12 features")
-
     arr = arr.reshape(1, -1)
     if SCALER is not None:
         try:
@@ -131,8 +143,32 @@ def _prepare_input(x: List[float]) -> np.ndarray:
             log.warning("Scaler.transform error: %s", e)
     return arr
 
+def _label_text(idx: int) -> str:
+    # ถ้ามี LabelEncoder
+    if LABEL_ENCODER is not None:
+        try:
+            return str(LABEL_ENCODER.inverse_transform([idx])[0])
+        except Exception:
+            pass
+    return {0: "ปกติ", 1: "สกปรก", 2: "แตก"}.get(idx, str(idx))
+
+def _choose_voltage(req: PredictIn) -> Optional[float]:
+    """
+    เลือกค่าแรงดันที่จะใช้กับกฎ:
+    1) req.features.v ถ้ามี
+    2) ถ้า data=12 ใช้ v_mean index 9
+    3) อย่างอื่น fallback เป็น v_rms index 0
+    """
+    feats = req.features.data
+    if req.features.v is not None:
+        return float(req.features.v)
+    if len(feats) == 12:
+        return float(feats[9])     # v_mean
+    # fallback: v_rms (สำหรับ DC จะใกล้เคียงค่า V)
+    return float(feats[0])
+
 def infer_one(x: List[float]):
-    """คืน (label_idx, proba)"""
+    """คืน (label_idx, proba) จากโมเดล"""
     arr = _prepare_input(x)
     with torch.no_grad():
         t = torch.from_numpy(arr)
@@ -141,23 +177,6 @@ def infer_one(x: List[float]):
         idx = int(np.argmax(probs))
         prob = float(probs[idx])
         return idx, prob
-
-def send_telegram_message(text: str) -> bool:
-    token, chat_id = TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-    if not token or not chat_id:
-        log.info("Telegram TOKEN/CHAT_ID not set -> skip")
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=5)
-        if r.ok:
-            log.info("Telegram sent")
-            return True
-        log.warning("Telegram failed %s %s", r.status_code, r.text)
-        return False
-    except Exception as e:
-        log.warning("Telegram error: %s", e)
-        return False
 
 # ============== Endpoints ==============
 @app.get("/", tags=["root"])
@@ -171,12 +190,13 @@ def health():
 @app.post("/predict", response_model=PredictOut, tags=["inference"])
 def predict(req: PredictIn, request: Request):
     feats = req.features.data
-    v, i, p = req.features.v, req.features.i, req.features.p
+    v_in, i_in, p_in = req.features.v, req.features.i, req.features.p
     ip = request.client.host if request and request.client else "?"
 
-    log.info("Req from %s  data=%s  v=%s i=%s p=%s",
-             ip, np.round(feats, 6).tolist(), v, i, p)
+    log.info("Req from %s data=%s v=%s i=%s p=%s",
+             ip, np.round(feats, 5).tolist(), v_in, i_in, p_in)
 
+    # 1) ทำนายด้วยโมเดลก่อน
     try:
         label_idx, proba = infer_one(feats)
         label_txt = _label_text(label_idx)
@@ -184,20 +204,52 @@ def predict(req: PredictIn, request: Request):
         log.exception("Infer error: %s", e)
         raise HTTPException(status_code=400, detail="infer failed")
 
-    # ✅ แจ้งเตือน "ทุกครั้ง"
-    msg = f"พบแผงโซล่าเซลล์ประเภท “{label_txt}” (p={proba:.2f})"
-    if any(x is not None for x in (v, i, p)):
-        msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
-    send_telegram_message(msg)
+    # 2) เลือกแรงดันมาใช้กับกฎ
+    try:
+        v_used = _choose_voltage(req)
+    except Exception:
+        v_used = None
+
+    # 3) กฎแรงดันทับผลโมเดล (Override)
+    rule_applied = False
+    if v_used is not None:
+        if v_used < 38.0:
+            label_idx, label_txt, proba = 2, _label_text(2), 0.99
+            rule_applied = True
+        elif 38.0 <= v_used < 39.0:
+            label_idx, label_txt, proba = 1, _label_text(1), 0.95
+            rule_applied = True
+        elif v_used >= 39.0:
+            label_idx, label_txt, proba = 0, _label_text(0), 0.90
+            rule_applied = True
+
+    if rule_applied:
+        log.info("Voltage rule applied: V=%.3f => label=%s (p=%.2f)",
+                 v_used, label_txt, proba)
+    else:
+        log.info("Model used (no rule override). label=%s (p=%.2f)", label_txt, proba)
+
+    # 4) ส่ง Telegram (แจ้งทุกผล)
+    text = f"พบแผงโซล่าเซลล์ประเภท “{label_txt}” (p={proba:.2f})"
+    if v_in is not None or i_in is not None or p_in is not None:
+        text += f"\nV={v_in if v_in is not None else '-'}  I={i_in if i_in is not None else '-'}  P={p_in if p_in is not None else '-'}"
+    elif v_used is not None:
+        text += f"\nV={v_used:.3f}"
+
+    if label_idx in ALERT_LABELS and proba >= ALERT_PROBA:
+        ok = send_telegram_message(text)
+        log.info("Telegram sent: %s", ok)
 
     return PredictOut(
         label_idx=label_idx,
         label_text=label_txt,
         proba=round(proba, 6),
-        v=v, i=i, p=p
+        v=v_in if v_in is not None else (v_used if v_used is not None else None),
+        i=i_in,
+        p=p_in
     )
 
-# ============== Uvicorn boot (Render) ==============
+# ============== Uvicorn boot ==============
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
