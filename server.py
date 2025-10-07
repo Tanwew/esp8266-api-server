@@ -7,7 +7,6 @@
 #     38 <= V<39 -> สกปรก (label 1)
 #     V >= 39    -> ปกติ (label 0)
 # -------------------------------------------
-
 import os
 import logging
 from typing import List, Optional
