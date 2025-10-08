@@ -1,12 +1,11 @@
 # -------------------------------------------
 # ESP8266 PV Inference API + Dashboard + Telegram
+# Majority Vote (เลือกประเภทที่เยอะที่สุดจากผลล่าสุด)
 # -------------------------------------------
 import os
-import json
-import math
 import logging
 from typing import List, Optional
-from collections import deque
+from collections import deque, Counter
 from datetime import datetime, timezone
 
 import numpy as np
@@ -24,16 +23,18 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("api")
 
 # ============== FastAPI ==============
-app = FastAPI(title="ESP8266 PV Inference API", version="1.3")
+app = FastAPI(title="ESP8266 PV Inference API", version="2.0-majority")
 
 # ============== Config ==============
-# แจ้งเตือน: ตั้ง True = แจ้งทุกครั้ง / False = ตามเงื่อนไข
-ALWAYS_ALERT = True
-ALERT_LABELS = {1, 2}          # ใช้เมื่อ ALWAYS_ALERT=False
+ALWAYS_ALERT = True               # แจ้งทุกครั้ง (ถ้าอยากตาม threshold ให้ตั้ง False + ใช้ ALERT_* ด้านล่าง)
+ALERT_LABELS = {1, 2}
 ALERT_PROBA  = 0.80
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
+
+# ขนาดหน้าต่างสำหรับ majority vote (ตั้ง ENV MAJ_WINDOW ได้)
+MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "5"))
 
 # ============== Model / Scaler / LabelEncoder ==============
 class SimpleMLP(nn.Module):
@@ -98,7 +99,7 @@ class PredictOut(BaseModel):
     v: Optional[float] = None
     i: Optional[float] = None
     p: Optional[float] = None
-    rule: bool
+    rule: bool   # ที่นี่จะเป็น False เสมอ (ไม่ได้ใช้กติกาอื่น)
 
 # ============== Helpers ==============
 def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
@@ -140,13 +141,16 @@ def send_telegram_message(text: str) -> bool:
         log.warning("Telegram error: %s", e)
         return False
 
-# ============== History store (for /recent /stats /dashboard) ==============
+def _now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+# ============== Stores ==============
 HISTORY_MAX = 500
 HISTORY = deque(maxlen=HISTORY_MAX)
 COUNTS = {"ปกติ": 0, "สกปรก": 0, "แตก": 0}
 
-def _now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+# เก็บผลทำนายดิบจากโมเดลเพื่อ majority vote
+PRED_WINDOW = deque(maxlen=MAJ_WINDOW)
 
 def record_result(ip, label_idx, label_text, proba, v, i, p, rule):
     entry = {
@@ -165,8 +169,7 @@ def record_result(ip, label_idx, label_text, proba, v, i, p, rule):
         COUNTS[entry["label_text"]] += 1
 
 def _render_dashboard_html(rows):
-    def _fmt(x):
-        return "-" if x is None else x
+    def _fmt(x): return "-" if x is None else x
     head = """
 <!doctype html><html lang="th"><meta charset="utf-8">
 <title>PV Dashboard</title>
@@ -225,6 +228,12 @@ def dashboard():
     html = _render_dashboard_html(list(HISTORY)[:100])
     return HTMLResponse(content=html, status_code=200)
 
+@app.get("/window")
+def window():
+    """ดูสถานะหน้าต่าง majority vote (ช่วยดีบัก)"""
+    cnt = Counter(PRED_WINDOW)
+    return {"size": len(PRED_WINDOW), "window": list(PRED_WINDOW), "counts": dict(cnt)}
+
 # ============== Predict core ==============
 def infer_one(x: List[float]):
     arr = _prepare_input(x)
@@ -236,22 +245,13 @@ def infer_one(x: List[float]):
         prob = float(probs[idx])
         return idx, prob
 
-def _apply_voltage_rule(v: Optional[float]):
-    """
-    คืน (is_applied, idx, prob, label_txt)
-    Rule:
-      v < 37      -> 2 "แตก"
-      37 <= v < 39 -> 1 "สกปรก"
-      v >= 39     -> 0 "ปกติ"
-    """
-    if v is None:
-        return False, None, None, None
-    if v < 37.0:
-        return True, 2, 1.0, "แตก"
-    elif v < 38.0:
-        return True, 1, 1.0, "สกปรก"
-    else:
-        return True, 0, 1.0, "ปกติ"
+def majority_vote_put_get(idx_raw: int):
+    """ใส่ label ดิบลงหน้าต่าง แล้วคืนผล majority (label_idx, confidence)"""
+    PRED_WINDOW.append(idx_raw)
+    cnt = Counter(PRED_WINDOW)
+    label_idx, n = max(cnt.items(), key=lambda kv: kv[1])
+    conf = n / len(PRED_WINDOW)
+    return label_idx, conf
 
 @app.post("/predict", response_model=PredictOut, tags=["inference"])
 def predict(req: PredictIn, request: Request):
@@ -259,31 +259,31 @@ def predict(req: PredictIn, request: Request):
     v, i, p = req.features.v, req.features.i, req.features.p
     ip = request.client.host if request and request.client else "?"
 
-    log.info("Req from %s data=%s v=%s i=%s p=%s", ip, np.round(feats, 5).tolist(), v, i, p)
+    log.info("Req from %s data=%s v=%s i=%s p=%s",
+             ip, np.round(feats, 5).tolist(), v, i, p)
 
-    # 1) ลองใช้กติกาแรงดันก่อน (ถ้ามีค่า v)
-    applied_by_rule, ridx, rprob, rtxt = _apply_voltage_rule(v)
-    if applied_by_rule:
-        label_idx = ridx
-        proba = rprob
-        label_txt = rtxt
-        log.info("Voltage rule applied: V=%.3f => label=%s (p=%.2f)", v, label_txt, proba)
-    else:
-        # 2) ไม่มีกติกาแรงดัน -> ใช้โมเดล
-        try:
-            label_idx, proba = infer_one(feats)
-            label_txt = _label_text(label_idx)
-        except Exception as e:
-            log.exception("Infer error: %s", e)
-            raise HTTPException(status_code=400, detail="infer failed")
+    # 1) ทำนายด้วยโมเดล (ผลดิบ)
+    try:
+        raw_idx, _ = infer_one(feats)
+    except Exception as e:
+        log.exception("Infer error: %s", e)
+        raise HTTPException(status_code=400, detail="infer failed")
 
-    # 3) บันทึกผลไว้ดูใน /recent /stats /dashboard
-    record_result(ip, label_idx, label_txt, proba, v, i, p, applied_by_rule)
+    # 2) Majority vote
+    label_idx, maj_conf = majority_vote_put_get(raw_idx)
+    label_txt = _label_text(label_idx)
+    proba = float(maj_conf)
 
-    # 4) แจ้งเตือน Telegram
+    log.info("Majority vote: raw=%s -> final=%s (conf=%.2f, window=%d)",
+             _label_text(raw_idx), label_txt, proba, len(PRED_WINDOW))
+
+    # 3) บันทึกผลไว้ดู
+    record_result(ip, label_idx, label_txt, proba, v, i, p, False)
+
+    # 4) แจ้งเตือน
     if ALWAYS_ALERT or (label_idx in ALERT_LABELS and proba >= ALERT_PROBA):
         msg = f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})"
-        if v is not None or i is not None or p is not None:
+        if any(x is not None for x in (v, i, p)):
             msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
         if send_telegram_message(msg):
             log.info("Telegram sent.")
@@ -295,7 +295,7 @@ def predict(req: PredictIn, request: Request):
         label_text=label_txt,
         proba=round(proba, 6),
         v=v, i=i, p=p,
-        rule=applied_by_rule
+        rule=False
     )
 
 # ============== Uvicorn boot ==============
