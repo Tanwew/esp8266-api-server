@@ -240,8 +240,8 @@ def _apply_voltage_rule(v: Optional[float]):
     """
     คืน (is_applied, idx, prob, label_txt)
     Rule:
-      v < 38      -> 2 "แตก"
-      38 <= v < 39 -> 1 "สกปรก"
+      v < 37      -> 2 "แตก"
+      37 <= v < 39 -> 1 "สกปรก"
       v >= 39     -> 0 "ปกติ"
     """
     if v is None:
