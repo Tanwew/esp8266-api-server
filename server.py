@@ -246,9 +246,9 @@ def _apply_voltage_rule(v: Optional[float]):
     """
     if v is None:
         return False, None, None, None
-    if v < 38.0:
+    if v < 37.0:
         return True, 2, 1.0, "แตก"
-    elif v < 39.0:
+    elif v < 38.0:
         return True, 1, 1.0, "สกปรก"
     else:
         return True, 0, 1.0, "ปกติ"
