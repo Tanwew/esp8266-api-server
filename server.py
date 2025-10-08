@@ -26,9 +26,10 @@ log = logging.getLogger("api")
 app = FastAPI(title="ESP8266 PV Inference API", version="2.0-majority")
 
 # ============== Config ==============
-ALWAYS_ALERT = True               # แจ้งทุกครั้ง (ถ้าอยากตาม threshold ให้ตั้ง False + ใช้ ALERT_* ด้านล่าง)
+# แจ้งเฉพาะ “ไม่ปกติ” เท่านั้น
+ALWAYS_ALERT = False
 ALERT_LABELS = {1, 2}
-ALERT_PROBA  = 0.80
+ALERT_PROBA  = 0.80  # ไม่ได้ใช้เมื่อ ALWAYS_ALERT=False และเราเช็ก label_idx != 0
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
@@ -99,7 +100,7 @@ class PredictOut(BaseModel):
     v: Optional[float] = None
     i: Optional[float] = None
     p: Optional[float] = None
-    rule: bool   # ที่นี่จะเป็น False เสมอ (ไม่ได้ใช้กติกาอื่น)
+    rule: bool   # majority vote -> False เสมอ
 
 # ============== Helpers ==============
 def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
@@ -262,7 +263,7 @@ def predict(req: PredictIn, request: Request):
     log.info("Req from %s data=%s v=%s i=%s p=%s",
              ip, np.round(feats, 5).tolist(), v, i, p)
 
-    # 1) ทำนายด้วยโมเดล (ผลดิบ)
+    # 1) ทำนายผลดิบ
     try:
         raw_idx, _ = infer_one(feats)
     except Exception as e:
@@ -280,8 +281,8 @@ def predict(req: PredictIn, request: Request):
     # 3) บันทึกผลไว้ดู
     record_result(ip, label_idx, label_txt, proba, v, i, p, False)
 
-    # 4) แจ้งเตือน
-    if ALWAYS_ALERT or (label_idx in ALERT_LABELS and proba >= ALERT_PROBA):
+    # 4) แจ้งเตือน: ส่งเมื่อผลไม่ใช่ “ปกติ(0)”
+    if label_idx != 0:
         msg = f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})"
         if any(x is not None for x in (v, i, p)):
             msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
