@@ -23,13 +23,17 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("api")
 
 # ============== FastAPI ==============
-app = FastAPI(title="ESP8266 PV Inference API", version="2.1-fixedmsg")
+app = FastAPI(title="ESP8266 PV Inference API", version="2.0-majority")
 
 # ============== Config ==============
-ONLY_ALERT_ABNORMAL = True  # แจ้งเฉพาะ "ไม่ปกติ"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8279950843")
+# แจ้งเฉพาะ “ไม่ปกติ” (label_idx != 0)
+ONLY_ALERT_ABNORMAL = True   # ถ้าอยากแจ้งทุกผลให้ตั้งเป็น False
+SHOW_VIP = True              # แนบ V/I/P ในข้อความแจ้งเตือนหรือไม่
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
+
+# ขนาดหน้าต่างสำหรับ majority vote (ตั้ง ENV MAJ_WINDOW ได้)
 MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "5"))
 
 # ============== Model / Scaler / LabelEncoder ==============
@@ -74,7 +78,7 @@ MODEL.eval()
 
 # ============== Schemas ==============
 class FeaturePacket(BaseModel):
-    data: List[float]
+    data: List[float] = Field(..., description="Feature vector (9 หรือ 12)")
     v: Optional[float] = None
     i: Optional[float] = None
     p: Optional[float] = None
@@ -95,10 +99,12 @@ class PredictOut(BaseModel):
     v: Optional[float] = None
     i: Optional[float] = None
     p: Optional[float] = None
-    rule: bool
+    rule: bool   # majority vote -> False เสมอ
 
 # ============== Helpers ==============
 def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
+    # 12 -> 9: [v_rms, i_rms, p_rms, v_zc, i_zc, p_zc, v_ssc, i_ssc, p_ssc, v_mean, i_mean, p_mean]
+    # 9  ->     [v_rms, i_rms, p_rms, v_zc, i_zc, v_ssc, i_ssc, v_mean, i_mean]
     idx = [0, 1, 2, 3, 4, 6, 7, 9, 10]
     return arr12[idx]
 
@@ -142,6 +148,8 @@ def _now_iso():
 HISTORY_MAX = 500
 HISTORY = deque(maxlen=HISTORY_MAX)
 COUNTS = {"ปกติ": 0, "สกปรก": 0, "แตก": 0}
+
+# เก็บผลทำนายดิบจากโมเดลเพื่อ majority vote
 PRED_WINDOW = deque(maxlen=MAJ_WINDOW)
 
 def record_result(ip, label_idx, label_text, proba, v, i, p, rule):
@@ -160,58 +168,128 @@ def record_result(ip, label_idx, label_text, proba, v, i, p, rule):
     if entry["label_text"] in COUNTS:
         COUNTS[entry["label_text"]] += 1
 
+def _render_dashboard_html(rows):
+    def _fmt(x): return "-" if x is None else x
+    head = """
+<!doctype html><html lang="th"><meta charset="utf-8">
+<title>PV Dashboard</title>
+<style>
+body{background:#0d0d0d;color:#eee;font-family:system-ui,Arial,sans-serif;padding:24px}
+h1{font-size:20px;margin:0 0 12px}
+table{width:100%;border-collapse:collapse;background:#121212}
+th,td{padding:8px 10px;border-bottom:1px solid #222;text-align:left;font-size:14px}
+th{background:#1b1b1b}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-weight:600}
+.badge-0{background:#1b3f1b;color:#a6f3a6}
+.badge-1{background:#3f311b;color:#ffd18a}
+.badge-2{background:#3f1b1b;color:#ff9a9a}
+small{color:#aaa}
+</style>
+<h1>PV Dashboard <small>(ล่าสุด {n} รายการ)</small></h1>
+<table><thead><tr>
+<th>เวลา</th><th>IP</th><th>ประเภท</th><th>p</th><th>V</th><th>I</th><th>P</th><th>rule?</th>
+</tr></thead><tbody>
+""".replace("{n}", str(len(rows)))
+    body = []
+    for r in rows:
+        badge = {0:"badge-0",1:"badge-1",2:"badge-2"}.get(r["label_idx"], "badge-0")
+        body.append(
+            f"<tr>"
+            f"<td>{r['ts']}</td>"
+            f"<td>{_fmt(r['ip'])}</td>"
+            f"<td><span class='badge {badge}'>{r['label_text']}</span></td>"
+            f"<td>{_fmt(round(r['proba'],3))}</td>"
+            f"<td>{_fmt(r['v'])}</td>"
+            f"<td>{_fmt(r['i'])}</td>"
+            f"<td>{_fmt(r['p'])}</td>"
+            f"<td>{'✓' if r['rule'] else '-'}</td>"
+            f"</tr>"
+        )
+    tail = "</tbody></table></html>"
+    return head + "\n".join(body) + tail
+
 # ============== Endpoints ==============
 @app.get("/", tags=["root"])
 def root():
     return {"ok": True, "msg": "Server is running successfully!"}
 
+@app.get("/recent")
+def recent(n: int = 50):
+    n = max(1, min(int(n), HISTORY_MAX))
+    return list(HISTORY)[:n]
+
+@app.get("/stats")
+def stats():
+    total = sum(COUNTS.values())
+    return {"total": total, "counts": COUNTS}
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    rows = list(HISTORY)[:100]
-    html = f"<h3>PV Dashboard ({len(rows)} records)</h3><pre>{rows}</pre>"
-    return HTMLResponse(content=html)
+    html = _render_dashboard_html(list(HISTORY)[:100])
+    return HTMLResponse(content=html, status_code=200)
+
+@app.get("/window")
+def window():
+    """ดูสถานะหน้าต่าง majority vote (ช่วยดีบัก)"""
+    cnt = Counter(PRED_WINDOW)
+    return {"size": len(PRED_WINDOW), "window": list(PRED_WINDOW), "counts": dict(cnt)}
 
 # ============== Predict core ==============
 def infer_one(x: List[float]):
     arr = _prepare_input(x)
     with torch.no_grad():
-        y = MODEL(torch.from_numpy(arr))
+        t = torch.from_numpy(arr)
+        y = MODEL(t)
         probs = y.numpy()[0]
         idx = int(np.argmax(probs))
         prob = float(probs[idx])
         return idx, prob
 
 def majority_vote_put_get(idx_raw: int):
+    """ใส่ label ดิบลงหน้าต่าง แล้วคืนผล majority (label_idx, confidence)"""
     PRED_WINDOW.append(idx_raw)
     cnt = Counter(PRED_WINDOW)
     label_idx, n = max(cnt.items(), key=lambda kv: kv[1])
     conf = n / len(PRED_WINDOW)
     return label_idx, conf
 
-@app.post("/predict", response_model=PredictOut)
+@app.post("/predict", response_model=PredictOut, tags=["inference"])
 def predict(req: PredictIn, request: Request):
     feats = req.features.data
     v, i, p = req.features.v, req.features.i, req.features.p
     ip = request.client.host if request and request.client else "?"
 
+    log.info("Req from %s data=%s v=%s i=%s p=%s",
+             ip, np.round(feats, 5).tolist(), v, i, p)
+
+    # 1) ทำนายผลดิบ
     try:
         raw_idx, _ = infer_one(feats)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Infer failed: {e}")
+        log.exception("Infer error: %s", e)
+        raise HTTPException(status_code=400, detail="infer failed")
 
+    # 2) Majority vote
     label_idx, maj_conf = majority_vote_put_get(raw_idx)
     label_txt = _label_text(label_idx)
     proba = float(maj_conf)
 
+    log.info("Majority vote: raw=%s -> final=%s (conf=%.2f, window=%d)",
+             _label_text(raw_idx), label_txt, proba, len(PRED_WINDOW))
+
+    # 3) บันทึกผลไว้ดู
     record_result(ip, label_idx, label_txt, proba, v, i, p, False)
 
-    # ===== แจ้งเตือนรูปแบบใหม่ (2 บรรทัด) =====
+    # 4) แจ้งเตือน (ตามนโยบาย ONLY_ALERT_ABNORMAL)
     should_alert = (not ONLY_ALERT_ABNORMAL) or (label_idx != 0)
     if should_alert:
-        msg = f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})"
-        msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
-        log.info("[ALERT MSG]\n%s", msg)
-        send_telegram_message(msg)
+        msg = f'พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})'
+        if SHOW_VIP and any(x is not None for x in (v, i, p)):
+            msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
+        if send_telegram_message(msg):
+            log.info("Telegram sent.")
+        else:
+            log.info("Telegram skipped/failed.")
 
     return PredictOut(
         label_idx=label_idx,
@@ -221,7 +299,8 @@ def predict(req: PredictIn, request: Request):
         rule=False
     )
 
-# ============== Boot ==============
+# ============== Uvicorn boot ==============
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=10000, reload=False)
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
