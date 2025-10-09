@@ -26,9 +26,10 @@ log = logging.getLogger("api")
 app = FastAPI(title="ESP8266 PV Inference API", version="2.0-majority")
 
 # ============== Config ==============
-# แจ้งเฉพาะ “ไม่ปกติ” (label_idx != 0)
-ONLY_ALERT_ABNORMAL = True   # ถ้าอยากแจ้งทุกผลให้ตั้งเป็น False
-SHOW_VIP = True              # แนบ V/I/P ในข้อความแจ้งเตือนหรือไม่
+# แจ้งเฉพาะ “ไม่ปกติ” เท่านั้น
+ALWAYS_ALERT = False
+ALERT_LABELS = {1, 2}
+ALERT_PROBA  = 0.80  # ไม่ได้ใช้เมื่อ ALWAYS_ALERT=False และเราเช็ก label_idx != 0
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
@@ -280,11 +281,10 @@ def predict(req: PredictIn, request: Request):
     # 3) บันทึกผลไว้ดู
     record_result(ip, label_idx, label_txt, proba, v, i, p, False)
 
-    # 4) แจ้งเตือน (ตามนโยบาย ONLY_ALERT_ABNORMAL)
-    should_alert = (not ONLY_ALERT_ABNORMAL) or (label_idx != 0)
-    if should_alert:
-        msg = f'พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})'
-        if SHOW_VIP and any(x is not None for x in (v, i, p)):
+    # 4) แจ้งเตือน: ส่งเมื่อผลไม่ใช่ “ปกติ(0)”
+    if label_idx != 0:
+        msg = f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})"
+        if any(x is not None for x in (v, i, p)):
             msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
         if send_telegram_message(msg):
             log.info("Telegram sent.")
