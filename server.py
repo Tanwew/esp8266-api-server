@@ -1,4 +1,4 @@
-# ------------------------------------------- 
+# -------------------------------------------
 # ESP8266 PV Inference API + Dashboard + Telegram
 # Majority Vote (เลือกประเภทที่เยอะที่สุดจากผลล่าสุด)
 # -------------------------------------------
@@ -26,13 +26,15 @@ log = logging.getLogger("api")
 app = FastAPI(title="ESP8266 PV Inference API", version="2.0-majority")
 
 # ============== Config ==============
+# แจ้งเฉพาะ “ไม่ปกติ” เท่านั้น
 ALWAYS_ALERT = False
 ALERT_LABELS = {1, 2}
-ALERT_PROBA  = 0.80  
+ALERT_PROBA  = 0.80  # ไม่ได้ใช้เมื่อ ALWAYS_ALERT=False และเราเช็ก label_idx != 0
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
 
+# ขนาดหน้าต่างสำหรับ majority vote (ตั้ง ENV MAJ_WINDOW ได้)
 MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "5"))
 
 # ============== Model / Scaler / LabelEncoder ==============
@@ -98,10 +100,12 @@ class PredictOut(BaseModel):
     v: Optional[float] = None
     i: Optional[float] = None
     p: Optional[float] = None
-    rule: bool
+    rule: bool   # majority vote -> False เสมอ
 
 # ============== Helpers ==============
 def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
+    # 12 -> 9: [v_rms, i_rms, p_rms, v_zc, i_zc, p_zc, v_ssc, i_ssc, p_ssc, v_mean, i_mean, p_mean]
+    # 9  ->     [v_rms, i_rms, p_rms, v_zc, i_zc, v_ssc, i_ssc, v_mean, i_mean]
     idx = [0, 1, 2, 3, 4, 6, 7, 9, 10]
     return arr12[idx]
 
@@ -145,6 +149,8 @@ def _now_iso():
 HISTORY_MAX = 500
 HISTORY = deque(maxlen=HISTORY_MAX)
 COUNTS = {"ปกติ": 0, "สกปรก": 0, "แตก": 0}
+
+# เก็บผลทำนายดิบจากโมเดลเพื่อ majority vote
 PRED_WINDOW = deque(maxlen=MAJ_WINDOW)
 
 def record_result(ip, label_idx, label_text, proba, v, i, p, rule):
@@ -163,15 +169,71 @@ def record_result(ip, label_idx, label_text, proba, v, i, p, rule):
     if entry["label_text"] in COUNTS:
         COUNTS[entry["label_text"]] += 1
 
+def _render_dashboard_html(rows):
+    def _fmt(x): return "-" if x is None else x
+    head = """
+<!doctype html><html lang="th"><meta charset="utf-8">
+<title>PV Dashboard</title>
+<style>
+body{background:#0d0d0d;color:#eee;font-family:system-ui,Arial,sans-serif;padding:24px}
+h1{font-size:20px;margin:0 0 12px}
+table{width:100%;border-collapse:collapse;background:#121212}
+th,td{padding:8px 10px;border-bottom:1px solid #222;text-align:left;font-size:14px}
+th{background:#1b1b1b}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-weight:600}
+.badge-0{background:#1b3f1b;color:#a6f3a6}
+.badge-1{background:#3f311b;color:#ffd18a}
+.badge-2{background:#3f1b1b;color:#ff9a9a}
+small{color:#aaa}
+</style>
+<h1>PV Dashboard <small>(ล่าสุด {n} รายการ)</small></h1>
+<table><thead><tr>
+<th>เวลา</th><th>IP</th><th>ประเภท</th><th>p</th><th>V</th><th>I</th><th>P</th><th>rule?</th>
+</tr></thead><tbody>
+""".replace("{n}", str(len(rows)))
+    body = []
+    for r in rows:
+        badge = {0:"badge-0",1:"badge-1",2:"badge-2"}.get(r["label_idx"], "badge-0")
+        body.append(
+            f"<tr>"
+            f"<td>{r['ts']}</td>"
+            f"<td>{_fmt(r['ip'])}</td>"
+            f"<td><span class='badge {badge}'>{r['label_text']}</span></td>"
+            f"<td>{_fmt(round(r['proba'],3))}</td>"
+            f"<td>{_fmt(r['v'])}</td>"
+            f"<td>{_fmt(r['i'])}</td>"
+            f"<td>{_fmt(r['p'])}</td>"
+            f"<td>{'✓' if r['rule'] else '-'}</td>"
+            f"</tr>"
+        )
+    tail = "</tbody></table></html>"
+    return head + "\n".join(body) + tail
+
 # ============== Endpoints ==============
 @app.get("/", tags=["root"])
 def root():
     return {"ok": True, "msg": "Server is running successfully!"}
 
+@app.get("/recent")
+def recent(n: int = 50):
+    n = max(1, min(int(n), HISTORY_MAX))
+    return list(HISTORY)[:n]
+
+@app.get("/stats")
+def stats():
+    total = sum(COUNTS.values())
+    return {"total": total, "counts": COUNTS}
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    html = "<html><body><h3>PV Dashboard is running...</h3></body></html>"
+    html = _render_dashboard_html(list(HISTORY)[:100])
     return HTMLResponse(content=html, status_code=200)
+
+@app.get("/window")
+def window():
+    """ดูสถานะหน้าต่าง majority vote (ช่วยดีบัก)"""
+    cnt = Counter(PRED_WINDOW)
+    return {"size": len(PRED_WINDOW), "window": list(PRED_WINDOW), "counts": dict(cnt)}
 
 # ============== Predict core ==============
 def infer_one(x: List[float]):
@@ -185,35 +247,59 @@ def infer_one(x: List[float]):
         return idx, prob
 
 def majority_vote_put_get(idx_raw: int):
+    """ใส่ label ดิบลงหน้าต่าง แล้วคืนผล majority (label_idx, confidence)"""
     PRED_WINDOW.append(idx_raw)
     cnt = Counter(PRED_WINDOW)
     label_idx, n = max(cnt.items(), key=lambda kv: kv[1])
     conf = n / len(PRED_WINDOW)
     return label_idx, conf
 
-@app.post("/predict", response_model=PredictOut)
+@app.post("/predict", response_model=PredictOut, tags=["inference"])
 def predict(req: PredictIn, request: Request):
     feats = req.features.data
     v, i, p = req.features.v, req.features.i, req.features.p
     ip = request.client.host if request and request.client else "?"
 
+    log.info("Req from %s data=%s v=%s i=%s p=%s",
+             ip, np.round(feats, 5).tolist(), v, i, p)
+
+    # 1) ทำนายผลดิบ
     try:
         raw_idx, _ = infer_one(feats)
     except Exception as e:
         log.exception("Infer error: %s", e)
         raise HTTPException(status_code=400, detail="infer failed")
 
+    # 2) Majority vote
     label_idx, maj_conf = majority_vote_put_get(raw_idx)
     label_txt = _label_text(label_idx)
     proba = float(maj_conf)
+
+    log.info("Majority vote: raw=%s -> final=%s (conf=%.2f, window=%d)",
+             _label_text(raw_idx), label_txt, proba, len(PRED_WINDOW))
+
+    # 3) บันทึกผลไว้ดู
     record_result(ip, label_idx, label_txt, proba, v, i, p, False)
 
-    # ========= แจ้งเตือน Telegram =========
+    # 4) แจ้งเตือน: ส่งเมื่อผลไม่ใช่ “ปกติ(0)”
     if label_idx != 0:
-        p_str = f"{proba:.2f}"
-        v_str = "-" if v is None else f"{float(v):.2f}"
-        i_str = "-" if i is None else f"{float(i):.3f}"
-        pwr_str = "-" if p is None else f"{float(p):.4f}"
+        # ===== ฟอร์แมตข้อความตามที่คุณต้องการ =====
+        def _to_float_or_none(x):
+            if x is None:
+                return None
+            try:
+                return float(str(x).strip())
+            except Exception:
+                return None
+
+        def _fmt(x, nd):
+            val = _to_float_or_none(x)
+            return "-" if val is None else f"{val:.{nd}f}"
+
+        p_str   = f"{proba:.2f}"
+        v_str   = _fmt(v, 2)
+        i_str   = _fmt(i, 3)
+        pwr_str = _fmt(p, 4)
 
         msg = (
             f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={p_str})\n"
