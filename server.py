@@ -1,6 +1,6 @@
 # -------------------------------------------
 # ESP8266 PV Inference API + Dashboard + Telegram
-# Majority Vote (เลือกประเภทที่เยอะที่สุดจากผลล่าสุด)
+# Majority Vote + Voltage Helper Rule (37/39)
 # -------------------------------------------
 import os
 import logging
@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import pickle
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, validator
 
@@ -23,19 +23,21 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("api")
 
 # ============== FastAPI ==============
-app = FastAPI(title="ESP8266 PV Inference API", version="2.0-majority")
+app = FastAPI(title="ESP8266 PV Inference API", version="2.1-majority+vrule")
 
 # ============== Config ==============
 # แจ้งเฉพาะ “ไม่ปกติ” เท่านั้น
-ALWAYS_ALERT = False
-ALERT_LABELS = {1, 2}
-ALERT_PROBA  = 0.80  # ไม่ได้ใช้เมื่อ ALWAYS_ALERT=False และเราเช็ก label_idx != 0
+ONLY_ALERT_ABNORMAL = True
+SHOW_VIP = True  # แนบ V/I/P ในข้อความแจ้งเตือนหรือไม่
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
 
-# ขนาดหน้าต่างสำหรับ majority vote (ตั้ง ENV MAJ_WINDOW ได้)
-MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "1"))
+# Majority window (จำนวนผลล่าสุดที่จะใช้โหวต) — เปลี่ยนได้ที่ ENV MAJ_WINDOW
+MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "5"))
+
+# ถ้า confidence ของ majority ต่ำกว่าเกณฑ์นี้ และแรงดันชี้อีกคลาส → เชื่อแรงดัน
+MAJ_CONF_THRESHOLD = float(os.getenv("MAJ_CONF_THRESHOLD", "0.60"))
 
 # ============== Model / Scaler / LabelEncoder ==============
 class SimpleMLP(nn.Module):
@@ -100,7 +102,7 @@ class PredictOut(BaseModel):
     v: Optional[float] = None
     i: Optional[float] = None
     p: Optional[float] = None
-    rule: bool   # majority vote -> False เสมอ
+    rule: bool   # True ถ้าใช้ตัวช่วยแรงดัน
 
 # ============== Helpers ==============
 def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
@@ -235,6 +237,11 @@ def window():
     cnt = Counter(PRED_WINDOW)
     return {"size": len(PRED_WINDOW), "window": list(PRED_WINDOW), "counts": dict(cnt)}
 
+@app.post("/reset_window", status_code=status.HTTP_204_NO_CONTENT)
+def reset_window():
+    PRED_WINDOW.clear()
+    return
+
 # ============== Predict core ==============
 def infer_one(x: List[float]):
     arr = _prepare_input(x)
@@ -254,6 +261,22 @@ def majority_vote_put_get(idx_raw: int):
     conf = n / len(PRED_WINDOW)
     return label_idx, conf
 
+def voltage_helper(v: Optional[float]):
+    """
+    ตัวช่วยแรงดัน:
+      v < 37      -> (2, "แตก")
+      37 <= v < 39 -> (1, "สกปรก")
+      v >= 39     -> (0, "ปกติ")
+    """
+    if v is None:
+        return None, None
+    if v < 37.0:
+        return 2, "แตก"
+    elif v < 39.0:
+        return 1, "สกปรก"
+    else:
+        return 0, "ปกติ"
+
 @app.post("/predict", response_model=PredictOut, tags=["inference"])
 def predict(req: PredictIn, request: Request):
     feats = req.features.data
@@ -263,28 +286,41 @@ def predict(req: PredictIn, request: Request):
     log.info("Req from %s data=%s v=%s i=%s p=%s",
              ip, np.round(feats, 5).tolist(), v, i, p)
 
-    # 1) ทำนายผลดิบ
+    # 1) ทำนายผลดิบ -> majority vote
     try:
         raw_idx, _ = infer_one(feats)
     except Exception as e:
         log.exception("Infer error: %s", e)
         raise HTTPException(status_code=400, detail="infer failed")
 
-    # 2) Majority vote
     label_idx, maj_conf = majority_vote_put_get(raw_idx)
     label_txt = _label_text(label_idx)
     proba = float(maj_conf)
+    used_rule = False
 
-    log.info("Majority vote: raw=%s -> final=%s (conf=%.2f, window=%d)",
-             _label_text(raw_idx), label_txt, proba, len(PRED_WINDOW))
+    # 2) ตัวช่วยแรงดัน (ไม่ทับ majority ทุกกรณี — ใช้เฉพาะกรณีที่กำหนดไว้)
+    rule_idx, rule_txt = voltage_helper(v)
+    if rule_idx is not None:
+        # เงื่อนไขใช้กติกา
+        if (label_idx == 0 and rule_idx in (1, 2)) \
+           or (proba < MAJ_CONF_THRESHOLD and rule_idx != label_idx):
+            label_idx = rule_idx
+            label_txt = rule_txt
+            used_rule = True
+            log.info("Voltage helper applied: V=%.3f => %s", v, label_txt)
 
     # 3) บันทึกผลไว้ดู
-    record_result(ip, label_idx, label_txt, proba, v, i, p, False)
+    record_result(ip, label_idx, label_txt, proba, v, i, p, used_rule)
 
-    # 4) แจ้งเตือน: ส่งเมื่อผลไม่ใช่ “ปกติ(0)”
-    if label_idx != 0:
+    # 4) แจ้งเตือน (ตามนโยบาย: แจ้งเฉพาะไม่ปกติ)
+    if ONLY_ALERT_ABNORMAL:
+        should_alert = (label_idx != 0)
+    else:
+        should_alert = True
+
+    if should_alert:
         msg = f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})"
-        if any(x is not None for x in (v, i, p)):
+        if SHOW_VIP and any(x is not None for x in (v, i, p)):
             msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
         if send_telegram_message(msg):
             log.info("Telegram sent.")
@@ -296,7 +332,7 @@ def predict(req: PredictIn, request: Request):
         label_text=label_txt,
         proba=round(proba, 6),
         v=v, i=i, p=p,
-        rule=False
+        rule=used_rule
     )
 
 # ============== Uvicorn boot ==============
