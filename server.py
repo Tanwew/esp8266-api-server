@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import pickle
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, validator
 
@@ -29,7 +29,7 @@ app = FastAPI(title="ESP8266 PV Inference API", version="2.0-majority")
 # แจ้งเฉพาะ “ไม่ปกติ” เท่านั้น
 ALWAYS_ALERT = False
 ALERT_LABELS = {1, 2}
-ALERT_PROBA  = 0.80  # ไม่ได้ใช้เมื่อ ALWAYS_ALERT=False และเราเช็ก label_idx != 0
+ALERT_PROBA  = 0.80  # (ไม่ได้ใช้เมื่อ ALWAYS_ALERT=False และเราเช็ก label_idx != 0)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
@@ -234,6 +234,12 @@ def window():
     """ดูสถานะหน้าต่าง majority vote (ช่วยดีบัก)"""
     cnt = Counter(PRED_WINDOW)
     return {"size": len(PRED_WINDOW), "window": list(PRED_WINDOW), "counts": dict(cnt)}
+
+# 👉 เพิ่ม: รีเซ็ตหน้าต่าง majority vote (อย่างเดียว)
+@app.post("/reset_window", status_code=status.HTTP_204_NO_CONTENT)
+def reset_window():
+    PRED_WINDOW.clear()
+    return
 
 # ============== Predict core ==============
 def infer_one(x: List[float]):
