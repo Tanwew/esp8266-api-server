@@ -34,7 +34,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTO
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "8279950843")
 
 # ขนาดหน้าต่างสำหรับ majority vote (เช่น 5)
-MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "5"))
+MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "128"))
 
 # ============== Model / Scaler / LabelEncoder ==============
 class SimpleMLP(nn.Module):
