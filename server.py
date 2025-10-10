@@ -283,29 +283,9 @@ def predict(req: PredictIn, request: Request):
 
     # 4) แจ้งเตือน: ส่งเมื่อผลไม่ใช่ “ปกติ(0)”
     if label_idx != 0:
-        # ===== ฟอร์แมตข้อความตามที่คุณต้องการ =====
-        def _to_float_or_none(x):
-            if x is None:
-                return None
-            try:
-                return float(str(x).strip())
-            except Exception:
-                return None
-
-        def _fmt(x, nd):
-            val = _to_float_or_none(x)
-            return "-" if val is None else f"{val:.{nd}f}"
-
-        p_str   = f"{proba:.2f}"
-        v_str   = _fmt(v, 2)
-        i_str   = _fmt(i, 3)
-        pwr_str = _fmt(p, 4)
-
-        msg = (
-            f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={p_str})\n"
-            f"V={v_str}  I={i_str}  P={pwr_str}"
-        )
-
+        msg = f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={proba:.2f})"
+        if any(x is not None for x in (v, i, p)):
+            msg += f"\nV={v if v is not None else '-'}  I={i if i is not None else '-'}  P={p if p is not None else '-'}"
         if send_telegram_message(msg):
             log.info("Telegram sent.")
         else:
