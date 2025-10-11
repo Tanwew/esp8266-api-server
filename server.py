@@ -1,6 +1,6 @@
 # -------------------------------------------
 # ESP8266 PV Inference API + Dashboard + Telegram
-# Majority Vote (แบบไหนเยอะสุด) + Voltage Helper
+# Majority Vote (แบบไหนเยอะสุด) + Voltage Helper (Override เสมอ)
 # -------------------------------------------
 import os
 import logging
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("api")
 
 # ============== FastAPI ==============
-app = FastAPI(title="ESP8266 PV Inference API", version="2.2-majority-voltage")
+app = FastAPI(title="ESP8266 PV Inference API", version="2.3-majority-voltage-override")
 
 # ============== Config ==============
 ONLY_ALERT_ABNORMAL = True          # แจ้งเฉพาะไม่ปกติ (1/2)
@@ -32,10 +32,8 @@ SHOW_VIP = True                     # แนบค่า V/I/P ในข้อ�
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8091687691:AAHRnXog3_BEFTOdbmPXlSkCXPaRSt9eCE4")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "8279950843")
 
-# หน้าต่างสำหรับ Majority Vote (เช่น 5 รายการล่าสุด)
+# หน้าต่างสำหรับ Majority Vote (เช่น 5 ผลล่าสุด)
 MAJ_WINDOW = int(os.getenv("MAJ_WINDOW", "5"))
-# ถ้า ‘ความถี่’ ของเสียงส่วนใหญ่ต่ำกว่า threshold นี้ จะให้ “ตัวช่วยแรงดัน” ช่วยเปลี่ยนผล
-MAJ_CONF_THRESHOLD = float(os.getenv("MAJ_CONF_THRESHOLD", "0.60"))
 
 # ============== Model / Scaler / LabelEncoder ==============
 class SimpleMLP(nn.Module):
@@ -103,7 +101,8 @@ class PredictOut(BaseModel):
 
 # ============== Helpers ==============
 def _map_12_to_9(arr12: np.ndarray) -> np.ndarray:
-    # [v_rms, i_rms, p_rms, v_zc, i_zc, v_ssc, i_ssc, v_mean, i_mean]
+    # 12 -> 9: [v_rms, i_rms, p_rms, v_zc, i_zc, p_zc, v_ssc, i_ssc, p_ssc, v_mean, i_mean, p_mean]
+    # 9  ->     [v_rms, i_rms, p_rms, v_zc, i_zc, v_ssc, i_ssc, v_mean, i_mean]
     idx = [0, 1, 2, 3, 4, 6, 7, 9, 10]
     return arr12[idx]
 
@@ -250,7 +249,12 @@ def majority_vote_put_get(idx_raw: int):
     return label_idx, conf
 
 def voltage_helper(v: Optional[float]):
-    """ตัวช่วยแรงดัน: <37=แตก, 37..38.99=สกปรก, >=39=ปกติ"""
+    """
+    ตัวช่วยแรงดัน (Override เสมอเมื่อมีค่า V):
+      v < 37.0        -> 2 'แตก'
+      37.0 <= v < 38.99 -> 1 'สกปรก'
+      v >= 39.0       -> 0 'ปกติ'
+    """
     if v is None:
         return None, None
     if v < 37.0:
@@ -266,6 +270,9 @@ def predict(req: PredictIn, request: Request):
     v, i, p = req.features.v, req.features.i, req.features.p
     ip = request.client.host if request and request.client else "?"
 
+    log.info("Req from %s data=%s v=%s i=%s p=%s",
+             ip, np.round(feats, 5).tolist(), v, i, p)
+
     # 1) ทำนายดิบจากโมเดล
     try:
         raw_idx, _ = infer_one(feats)
@@ -273,22 +280,20 @@ def predict(req: PredictIn, request: Request):
         log.exception("Infer error: %s", e)
         raise HTTPException(status_code=400, detail="infer failed")
 
-    # 2) Majority vote → ใช้ “แบบที่เยอะสุด”
-    label_idx, maj_conf = majority_vote_put_get(raw_idx)   # maj_conf = ความถี่ของแบบที่ชนะ (0..1)
+    # 2) Majority vote (แบบที่เยอะสุด)
+    label_idx, maj_conf = majority_vote_put_get(raw_idx)
     label_txt = _label_text(label_idx)
     used_rule = False
 
-    # 3) ตัวช่วยแรงดัน (ใช้เฉพาะกรณีผล majority ยังไม่น่าเชื่อถือ หรือตรงข้ามชัดเจน)
+    # 3) ตัวช่วยแรงดัน: ให้ "แรงดันชนะเสมอ" (ถ้ามีค่า v)
     rule_idx, rule_txt = voltage_helper(v)
     if rule_idx is not None:
-        # ถ้าเสียงส่วนใหญ่ยังบาง (ต่ำกว่า threshold) หรือ majority=ปกติ แต่แรงดันชี้ผิดปกติ → ใช้ตามแรงดัน
-        if (maj_conf < MAJ_CONF_THRESHOLD) or (label_idx == 0 and rule_idx in (1, 2)):
-            label_idx, label_txt, used_rule = rule_idx, rule_txt, True
+        label_idx, label_txt, used_rule = rule_idx, rule_txt, True
 
     # 4) บันทึกไว้ดูใน /recent /stats /dashboard
     record_result(ip, label_idx, label_txt, maj_conf, v, i, p, used_rule)
 
-    # 5) แจ้งเตือนตาม “แบบที่เยอะสุด” (เว้นผลปกติ)
+    # 5) แจ้งเตือน (เว้นผลปกติ)
     if ONLY_ALERT_ABNORMAL and label_idx != 0:
         msg = f"พบแผงโซล่าเซลล์ประเภท “{label_idx}” {label_txt} (p={maj_conf:.2f})"
         if SHOW_VIP and any(x is not None for x in (v, i, p)):
@@ -298,7 +303,7 @@ def predict(req: PredictIn, request: Request):
     return PredictOut(
         label_idx=label_idx,
         label_text=label_txt,
-        proba=round(maj_conf, 6),   # แสดง 'ความถี่' ของแบบที่เยอะสุด
+        proba=round(maj_conf, 6),   # ค่า p ที่โชว์ = 'ความถี่' ของผลที่ชนะในหน้าต่าง
         v=v, i=i, p=p,
         rule=used_rule
     )
